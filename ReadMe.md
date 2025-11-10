@@ -125,6 +125,6 @@ Feel free to use, modify, and build upon SCXIS with proper attribution.
 
 For queries or collaboration, contact:
 📧 [rashmiranjansutar8@gmail.com](mailto:rashmiranjansutar8@gmail.com)
-🔗 [LinkedIn Profile]([https://www.linkedin.com/in/your-link](https://www.linkedin.com/in/rashmi-ranjan-sutar-1a66232a4/))
+🔗 [LinkedIn Profile](https://www.linkedin.com/in/your-link](https://www.linkedin.com/in/rashmi-ranjan-sutar-1a66232a4/)
 
 ---
