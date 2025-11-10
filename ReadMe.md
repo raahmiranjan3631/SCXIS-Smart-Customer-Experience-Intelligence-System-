@@ -124,7 +124,7 @@ Feel free to use, modify, and build upon SCXIS with proper attribution.
 ## 💬 Contact
 
 For queries or collaboration, contact:
-📧 [your.email@example.com](mailto:your.email@example.com)
+📧 rashmiranjansutar8@gmail.com ( mailto:rashmiranjansutar8@gmail.com )
 🔗 [LinkedIn Profile](https://www.linkedin.com/in/your-link)
 
 ---
