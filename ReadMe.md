@@ -107,10 +107,7 @@ SCXIS/
 
 ## 🧑‍💻 Contributors
 
-* **[Your Name]** – Developer & Project Lead
-* **[Teammate Name]** – Co-developer / Model Integrator
-
-Organized under **Product Space AI Agent Hackathon 2025** 🧠
+* **Rashmi Ranjan Sutar** – Developer & Project Lead
 
 ---
 
