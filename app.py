@@ -1,14 +1,12 @@
 # app.py
 """
 SCXIS - Smart Customer Experience Intelligence System (Streamlit app)
-
-Features:
-- Live chat (session-based)
-- Sentiment analysis (distilbert)
-- Intent detection (zero-shot, lighter model)
-- Emotion detection (distilroberta)
-- CSAT collection and basic analytics dashboard
-- CSV export of chat history
+Patched & improved:
+ - Uses Hugging Face Inference API (no local torch required)
+ - Robust duplicate-submission guarding (last_processed + processing flag)
+ - Heuristic fallbacks if HF API or token is absent
+ - Live chat, sentiment, intent, emotion, CSAT, dashboard, CSV export
+Note: Add HF_API_TOKEN in Streamlit Secrets (key name: HF_API_TOKEN)
 """
 
 import streamlit as st
@@ -16,19 +14,14 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime
 import requests
-import time
 
 # ---------------------------
 # Config / Secrets
 # ---------------------------
 st.set_page_config(page_title="SCXIS", page_icon="🤖", layout="wide")
 
-HF_TOKEN = None
-try:
-    HF_TOKEN = st.secrets["HF_API_TOKEN"]
-except Exception:
-    HF_TOKEN = None
-
+# Read HF token from Streamlit secrets (safe storage)
+HF_TOKEN = st.secrets.get("HF_API_TOKEN") if "HF_API_TOKEN" in st.secrets else None
 HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
 # Candidate intents
@@ -38,11 +31,17 @@ CANDIDATE_INTENTS = ["complaint", "query", "feedback", "request", "greeting", "o
 # Session state init
 # ---------------------------
 if "messages" not in st.session_state:
-    st.session_state["messages"] = []
+    st.session_state["messages"] = []  # list of dicts
 if "csat" not in st.session_state:
     st.session_state["csat"] = []
 if "title" not in st.session_state:
     st.session_state["title"] = "SCXIS - Smart Customer Experience Intelligence System"
+if "last_processed" not in st.session_state:
+    st.session_state["last_processed"] = ""  # last processed user text
+if "processing" not in st.session_state:
+    st.session_state["processing"] = False
+if "user_input" not in st.session_state:
+    st.session_state["user_input"] = ""  # keeps input persistent across reruns
 
 # ---------------------------
 # HF Inference helpers
@@ -50,67 +49,46 @@ if "title" not in st.session_state:
 HF_BASE = "https://api-inference.huggingface.co/models"
 
 def hf_infer(model_id: str, payload: dict, timeout: int = 30):
-    """Call HF inference API and return parsed JSON or raise."""
+    """Call HF inference API and return parsed JSON. Raises on HTTP error."""
     url = f"{HF_BASE}/{model_id}"
-    try:
-        r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        # bubble up exception to caller (they will handle)
-        raise
+    r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 def analyze_sentiment_hf(text: str):
-    """Return (label, score) using HF sentiment model. Falls back to heuristic."""
     model = "distilbert-base-uncased-finetuned-sst-2-english"
-    try:
-        out = hf_infer(model, {"inputs": text})
-        if isinstance(out, list) and out:
-            label = out[0].get("label", "").lower()
-            score = float(out[0].get("score", 0.0))
-            if "positive" in label:
-                return "positive", score
-            if "negative" in label:
-                return "negative", score
-        return "neutral", 0.0
-    except Exception:
-        return heuristic_sentiment(text)
+    out = hf_infer(model, {"inputs": text})
+    if isinstance(out, list) and out:
+        label = out[0].get("label", "").lower()
+        score = float(out[0].get("score", 0.0))
+        if "positive" in label:
+            return "positive", score
+        if "negative" in label:
+            return "negative", score
+    return "neutral", 0.0
 
 def detect_intent_hf(text: str, candidate_labels=CANDIDATE_INTENTS):
-    """Return (intent_label, confidence). Falls back to heuristic."""
     model = "valhalla/distilbart-mnli-12-1"
-    try:
-        payload = {"inputs": text, "parameters": {"candidate_labels": candidate_labels}}
-        out = hf_infer(model, payload)
-        # HF zero-shot returns dict with labels & scores
-        labels = out.get("labels", [])
-        scores = out.get("scores", [])
-        if labels:
-            return labels[0], float(scores[0])
-        return "other", 0.0
-    except Exception:
-        return heuristic_intent(text), 0.0
+    payload = {"inputs": text, "parameters": {"candidate_labels": candidate_labels}}
+    out = hf_infer(model, payload)
+    labels = out.get("labels", [])
+    scores = out.get("scores", [])
+    if labels:
+        return labels[0], float(scores[0])
+    return "other", 0.0
 
 def detect_emotion_hf(text: str):
-    """Return (emotion_label, score). Falls back to heuristic."""
     model = "j-hartmann/emotion-english-distilroberta-base"
-    try:
-        out = hf_infer(model, {"inputs": text})
-        # Some models return list of dicts
-        if isinstance(out, list) and out:
-            label = out[0].get("label", "").lower()
-            score = float(out[0].get("score", 0.0))
-            return label, score
-        # else try to parse dict
-        if isinstance(out, dict):
-            # some models return mapping label->score
-            # pick top key
-            items = sorted(out.items(), key=lambda kv: kv[1], reverse=True)
-            if items:
-                return items[0][0].lower(), float(items[0][1])
-        return "neutral", 0.0
-    except Exception:
-        return heuristic_emotion(text)
+    out = hf_infer(model, {"inputs": text})
+    if isinstance(out, list) and out:
+        label = out[0].get("label", "").lower()
+        score = float(out[0].get("score", 0.0))
+        return label, score
+    if isinstance(out, dict):
+        items = sorted(out.items(), key=lambda kv: kv[1], reverse=True)
+        if items:
+            return items[0][0].lower(), float(items[0][1])
+    return "neutral", 0.0
 
 # ---------------------------
 # Simple heuristics (fallbacks)
@@ -121,9 +99,9 @@ CONF_WORDS = {"how","how do","what","why","can't","cannot","unable","confused","
 
 def heuristic_sentiment(text: str):
     t = text.lower()
-    neg = sum(w in t for w in NEG_WORDS)
-    pos = sum(w in t for w in POS_WORDS)
-    conf = sum(w in t for w in CONF_WORDS)
+    neg = sum(1 for w in NEG_WORDS if w in t)
+    pos = sum(1 for w in POS_WORDS if w in t)
+    conf = sum(1 for w in CONF_WORDS if w in t)
     if neg > max(pos, conf):
         return "negative", 0.6
     if pos > neg:
@@ -134,7 +112,7 @@ def heuristic_intent(text: str):
     t = text.lower()
     if any(k in t for k in ["refund","charge","billing","payment"]):
         return "complaint"
-    if any(k in t for k in ["how","what","why","where","help","assist","support","can you"]):
+    if any(k in t for k in ["how","what","why","where","help","assist","support","can you", "unable"]):
         return "query"
     if any(k in t for k in ["feedback","suggestion","recommend"]):
         return "feedback"
@@ -146,7 +124,7 @@ def heuristic_emotion(text: str):
     t = text.lower()
     if any(w in t for w in ["angry","furious","mad","irritat"]):
         return "anger", 0.7
-    if any(w in t for w in ["happy","thank","glad","love"]):
+    if any(w in t for w in ["happy","thank","glad","love","great"]):
         return "joy", 0.8
     if any(w in t for w in ["sad","disappointed","unhappy"]):
         return "sadness", 0.6
@@ -156,16 +134,14 @@ def heuristic_emotion(text: str):
 # Utility functions
 # ---------------------------
 def append_message(role: str, text: str, sentiment=None, intent=None, emotion=None):
-    st.session_state["messages"].append(
-        {
-            "role": role,
-            "text": text,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "sentiment": sentiment,
-            "intent": intent,
-            "emotion": emotion,
-        }
-    )
+    st.session_state["messages"].append({
+        "role": role,
+        "text": text,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "sentiment": sentiment,
+        "intent": intent,
+        "emotion": emotion
+    })
 
 def messages_to_df():
     if not st.session_state["messages"]:
@@ -186,6 +162,7 @@ st.title(st.session_state["title"])
 left_col, right_col = st.columns([2,1])
 with right_col:
     st.markdown("**Quick Actions**")
+    st.markdown("")
     if st.button("Export chat CSV"):
         df = messages_to_df()
         if df.empty:
@@ -200,7 +177,7 @@ with right_col:
     st.caption(f"CSAT Samples: {csat_count}")
     st.markdown("---")
     if not HF_TOKEN:
-        st.warning("HF_API_TOKEN missing in Streamlit secrets — using local heuristics as fallback. Set HF_API_TOKEN to enable HF inference API.")
+        st.warning("HF_API_TOKEN missing in Streamlit secrets — using heuristics as fallback. Add HF_API_TOKEN to enable HF Inference API.")
 
 # ---------------------------
 # Navigation
@@ -214,52 +191,74 @@ if page == "Live Chat":
     st.header("💬 Live Chat")
     st.markdown("Type a message — the system analyzes sentiment, intent, and emotion.")
 
-    with st.form("chat_form", clear_on_submit=True):
-        user_text = st.text_input("Type your message", key="user_input")
+    # Safer form that prevents duplicate processing
+    with st.form("chat_form", clear_on_submit=False):
+        st.session_state["user_input"] = st.text_input("Type your message", value=st.session_state["user_input"], key="user_input_widget")
         submitted = st.form_submit_button("Send")
-        if submitted and user_text:
-            # Prefer HF API; fall back to heuristics if HF token missing or call fails
-            try:
-                sent_label, sent_score = analyze_sentiment_hf(user_text)
-            except Exception:
-                sent_label, sent_score = heuristic_sentiment(user_text)
 
-            try:
-                intent_label, intent_score = detect_intent_hf(user_text, CANDIDATE_INTENTS)
-            except Exception:
-                intent_label, intent_score = heuristic_intent(user_text), 0.0
+        if submitted:
+            user_text = st.session_state["user_input"].strip()
 
-            try:
-                emotion_label, emotion_score = detect_emotion_hf(user_text)
-            except Exception:
-                emotion_label, emotion_score = heuristic_emotion(user_text)
-
-            append_message("user", user_text, sentiment=sent_label, intent=intent_label, emotion=emotion_label)
-
-            # simple response logic
-            if intent_label == "complaint" and sent_label == "negative":
-                bot_text = "😟 I'm sorry you're facing this issue. I'll escalate this to our support team."
-            elif intent_label == "query":
-                bot_text = "❓ Thanks — I can help with that. Could you share a bit more detail?"
-            elif intent_label == "feedback":
-                bot_text = "💡 Thank you for the feedback! We value it."
-            elif intent_label == "greeting":
-                bot_text = "👋 Hello! How can I assist you today?"
+            if st.session_state["processing"]:
+                st.warning("Still processing previous message — please wait.")
+            elif not user_text:
+                st.warning("Please enter a message.")
+            elif user_text == st.session_state["last_processed"]:
+                st.info("This message was just processed; please enter a new message.")
             else:
-                if sent_label == "positive":
-                    bot_text = "🙂 Great to hear! Anything else I can help with?"
-                elif sent_label == "negative":
-                    bot_text = "I understand. Can you share an order/issue ID so I can check?"
-                else:
-                    bot_text = "Thanks for sharing — I'll note this."
+                # start processing
+                st.session_state["processing"] = True
+                try:
+                    # Use HF API when token available; fall back to heuristics on errors
+                    try:
+                        sent_label, sent_score = analyze_sentiment_hf(user_text) if HF_TOKEN else heuristic_sentiment(user_text)
+                    except Exception:
+                        sent_label, sent_score = heuristic_sentiment(user_text)
 
-            append_message("bot", bot_text)
-            # rerun to show new messages
-            st.experimental_rerun()
+                    try:
+                        intent_label, intent_score = detect_intent_hf(user_text, CANDIDATE_INTENTS) if HF_TOKEN else (heuristic_intent(user_text), 0.0)
+                    except Exception:
+                        intent_label, intent_score = heuristic_intent(user_text), 0.0
+
+                    try:
+                        emotion_label, emotion_score = detect_emotion_hf(user_text) if HF_TOKEN else heuristic_emotion(user_text)
+                    except Exception:
+                        emotion_label, emotion_score = heuristic_emotion(user_text)
+
+                    # append user (only once)
+                    append_message("user", user_text, sentiment=sent_label, intent=intent_label, emotion=emotion_label)
+
+                    # bot response (simple rule-based)
+                    if intent_label == "complaint" and sent_label == "negative":
+                        bot_text = "😟 I'm sorry you're facing this issue. I'll escalate this to our support team."
+                    elif intent_label == "query":
+                        bot_text = "❓ Thanks — I can help with that. Could you share a bit more detail?"
+                    elif intent_label == "feedback":
+                        bot_text = "💡 Thank you for the feedback! We value it."
+                    elif intent_label == "greeting":
+                        bot_text = "👋 Hello! How can I assist you today?"
+                    else:
+                        if sent_label == "positive":
+                            bot_text = "🙂 Great to hear! Anything else I can help with?"
+                        elif sent_label == "negative":
+                            bot_text = "I understand. Can you share an order/issue ID so I can check?"
+                        else:
+                            bot_text = "Thanks for sharing — I'll note this."
+
+                    append_message("bot", bot_text)
+
+                    # update guards
+                    st.session_state["last_processed"] = user_text
+                    st.session_state["user_input"] = ""  # clear input
+                    st.success("Message processed.")
+                except Exception as e:
+                    st.error(f"Processing error: {e}")
+                finally:
+                    st.session_state["processing"] = False
 
     # show conversation
     st.subheader("Conversation (most recent)")
-    msgs = st.session_state["messages"][-30:]
+    msgs = st.session_state["messages"][-40:]
     for m in msgs:
         ts = m["timestamp"]
         if m["role"] == "user":
@@ -349,7 +348,5 @@ elif page == "Settings":
         """
     )
     st.markdown("Notes:")
-    st.markdown("- Set `HF_API_TOKEN` in Streamlit Secrets to enable HF inference. Without it the app uses light heuristics.")
+    st.markdown("- Set `HF_API_TOKEN` in Streamlit Secrets to enable HF Inference API. Without it the app uses heuristics.")
     st.markdown("- HF Inference API may add latency on first calls; consider caching repeated calls if needed.")
-
-    st.markdown("Model loading is cached to improve performance. For production, consider persistent DB storage and authentication.")
