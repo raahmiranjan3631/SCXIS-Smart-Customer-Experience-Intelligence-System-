@@ -1,12 +1,6 @@
 # app.py
 """
 SCXIS - Smart Customer Experience Intelligence System (Streamlit app)
-Patched & improved:
- - Uses Hugging Face Inference API (no local torch required)
- - Robust duplicate-submission guarding (last_processed + processing flag)
- - Heuristic fallbacks if HF API or token is absent
- - Live chat, sentiment, intent, emotion, CSAT, dashboard, CSV export
-Note: Add HF_API_TOKEN in Streamlit Secrets (key name: HF_API_TOKEN)
 """
 
 import streamlit as st
