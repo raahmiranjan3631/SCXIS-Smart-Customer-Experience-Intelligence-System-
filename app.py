@@ -15,114 +15,146 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from datetime import datetime
-from transformers import (
-    pipeline,
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-)
+import requests
+import time
 
 # ---------------------------
-# 1) Model loading (CPU-safe)
+# Config / Secrets
 # ---------------------------
-@st.cache_resource
-def load_pipelines():
-    # Sentiment model (smaller, fast)
-    sent_name = "distilbert-base-uncased-finetuned-sst-2-english"
-    sent_tok = AutoTokenizer.from_pretrained(sent_name)
-    sent_model = AutoModelForSequenceClassification.from_pretrained(sent_name)
-    sentiment_pipe = pipeline(
-        "sentiment-analysis",
-        model=sent_model,
-        tokenizer=sent_tok,
-        device=-1,  # CPU only
-    )
+st.set_page_config(page_title="SCXIS", page_icon="🤖", layout="wide")
 
-    # Intent (zero-shot) - lighter MNLI model
-    intent_name = "valhalla/distilbart-mnli-12-1"
-    intent_tok = AutoTokenizer.from_pretrained(intent_name)
-    intent_model = AutoModelForSequenceClassification.from_pretrained(intent_name)
-    intent_pipe = pipeline(
-        "zero-shot-classification",
-        model=intent_model,
-        tokenizer=intent_tok,
-        device=-1,
-    )
+HF_TOKEN = None
+try:
+    HF_TOKEN = st.secrets["HF_API_TOKEN"]
+except Exception:
+    HF_TOKEN = None
 
-    # Emotion detection - pretrained distilroberta based emotion model
-    emotion_name = "j-hartmann/emotion-english-distilroberta-base"
-    emotion_tok = AutoTokenizer.from_pretrained(emotion_name)
-    emotion_model = AutoModelForSequenceClassification.from_pretrained(emotion_name)
-    emotion_pipe = pipeline(
-        "text-classification",
-        model=emotion_model,
-        tokenizer=emotion_tok,
-        return_all_scores=False,
-        device=-1,
-    )
+HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-    return sentiment_pipe, intent_pipe, emotion_pipe
-
-# load models once (cached)
-sentiment_pipe, intent_pipe, emotion_pipe = load_pipelines()
-
-# ---------------------------
-# 2) Candidate labels / config
-# ---------------------------
+# Candidate intents
 CANDIDATE_INTENTS = ["complaint", "query", "feedback", "request", "greeting", "other"]
 
 # ---------------------------
-# 3) Session state init
+# Session state init
 # ---------------------------
 if "messages" not in st.session_state:
-    st.session_state["messages"] = []  # list of dicts {role, text, ts, sentiment, intent, emotion}
+    st.session_state["messages"] = []
 if "csat" not in st.session_state:
-    st.session_state["csat"] = []  # list of ints
+    st.session_state["csat"] = []
 if "title" not in st.session_state:
     st.session_state["title"] = "SCXIS - Smart Customer Experience Intelligence System"
 
 # ---------------------------
-# 4) Helper functions
+# HF Inference helpers
 # ---------------------------
-def analyze_sentiment(text: str):
-    """Return label ('positive'|'negative'|'neutral') and score."""
+HF_BASE = "https://api-inference.huggingface.co/models"
+
+def hf_infer(model_id: str, payload: dict, timeout: int = 30):
+    """Call HF inference API and return parsed JSON or raise."""
+    url = f"{HF_BASE}/{model_id}"
     try:
-        res = sentiment_pipe(text)[0]
-        label = res["label"].lower()
-        score = float(res.get("score", 0.0))
-        if "positive" in label:
-            return "positive", score
-        elif "negative" in label:
-            return "negative", score
-        else:
-            return "neutral", score
-    except Exception:
+        r = requests.post(url, headers=HF_HEADERS, json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        # bubble up exception to caller (they will handle)
+        raise
+
+def analyze_sentiment_hf(text: str):
+    """Return (label, score) using HF sentiment model. Falls back to heuristic."""
+    model = "distilbert-base-uncased-finetuned-sst-2-english"
+    try:
+        out = hf_infer(model, {"inputs": text})
+        if isinstance(out, list) and out:
+            label = out[0].get("label", "").lower()
+            score = float(out[0].get("score", 0.0))
+            if "positive" in label:
+                return "positive", score
+            if "negative" in label:
+                return "negative", score
         return "neutral", 0.0
+    except Exception:
+        return heuristic_sentiment(text)
 
-
-def detect_intent(text: str, candidate_labels=CANDIDATE_INTENTS):
-    """Return top intent label and confidence."""
+def detect_intent_hf(text: str, candidate_labels=CANDIDATE_INTENTS):
+    """Return (intent_label, confidence). Falls back to heuristic."""
+    model = "valhalla/distilbart-mnli-12-1"
     try:
-        res = intent_pipe(text, candidate_labels)
-        labels = res.get("labels", [])
-        scores = res.get("scores", [])
+        payload = {"inputs": text, "parameters": {"candidate_labels": candidate_labels}}
+        out = hf_infer(model, payload)
+        # HF zero-shot returns dict with labels & scores
+        labels = out.get("labels", [])
+        scores = out.get("scores", [])
         if labels:
             return labels[0], float(scores[0])
         return "other", 0.0
     except Exception:
-        return "other", 0.0
+        return heuristic_intent(text), 0.0
 
-
-def detect_emotion(text: str):
-    """Return top emotion label (e.g., joy, anger, sadness)."""
+def detect_emotion_hf(text: str):
+    """Return (emotion_label, score). Falls back to heuristic."""
+    model = "j-hartmann/emotion-english-distilroberta-base"
     try:
-        res = emotion_pipe(text)[0]
-        label = res.get("label", "")
-        score = float(res.get("score", 0.0))
-        return label.lower(), score
-    except Exception:
+        out = hf_infer(model, {"inputs": text})
+        # Some models return list of dicts
+        if isinstance(out, list) and out:
+            label = out[0].get("label", "").lower()
+            score = float(out[0].get("score", 0.0))
+            return label, score
+        # else try to parse dict
+        if isinstance(out, dict):
+            # some models return mapping label->score
+            # pick top key
+            items = sorted(out.items(), key=lambda kv: kv[1], reverse=True)
+            if items:
+                return items[0][0].lower(), float(items[0][1])
         return "neutral", 0.0
+    except Exception:
+        return heuristic_emotion(text)
 
+# ---------------------------
+# Simple heuristics (fallbacks)
+# ---------------------------
+NEG_WORDS = {"angry","upset","terrible","worst","hate","refund","broken","not working","issue","problem","delay"}
+POS_WORDS = {"good","great","love","awesome","happy","satisfied","thank","thanks","excellent","perfect"}
+CONF_WORDS = {"how","how do","what","why","can't","cannot","unable","confused","unclear"}
 
+def heuristic_sentiment(text: str):
+    t = text.lower()
+    neg = sum(w in t for w in NEG_WORDS)
+    pos = sum(w in t for w in POS_WORDS)
+    conf = sum(w in t for w in CONF_WORDS)
+    if neg > max(pos, conf):
+        return "negative", 0.6
+    if pos > neg:
+        return "positive", 0.7
+    return "neutral", 0.0
+
+def heuristic_intent(text: str):
+    t = text.lower()
+    if any(k in t for k in ["refund","charge","billing","payment"]):
+        return "complaint"
+    if any(k in t for k in ["how","what","why","where","help","assist","support","can you"]):
+        return "query"
+    if any(k in t for k in ["feedback","suggestion","recommend"]):
+        return "feedback"
+    if any(k in t for k in ["hi","hello","hey","good morning","good evening"]):
+        return "greeting"
+    return "other"
+
+def heuristic_emotion(text: str):
+    t = text.lower()
+    if any(w in t for w in ["angry","furious","mad","irritat"]):
+        return "anger", 0.7
+    if any(w in t for w in ["happy","thank","glad","love"]):
+        return "joy", 0.8
+    if any(w in t for w in ["sad","disappointed","unhappy"]):
+        return "sadness", 0.6
+    return "neutral", 0.0
+
+# ---------------------------
+# Utility functions
+# ---------------------------
 def append_message(role: str, text: str, sentiment=None, intent=None, emotion=None):
     st.session_state["messages"].append(
         {
@@ -135,19 +167,10 @@ def append_message(role: str, text: str, sentiment=None, intent=None, emotion=No
         }
     )
 
-
-def compute_csat_stats():
-    if not st.session_state["csat"]:
-        return {"count": 0, "avg": None}
-    vals = st.session_state["csat"]
-    return {"count": len(vals), "avg": sum(vals) / len(vals)}
-
-
 def messages_to_df():
     if not st.session_state["messages"]:
-        return pd.DataFrame(columns=["role", "text", "timestamp", "sentiment", "intent", "emotion"])
+        return pd.DataFrame(columns=["role","text","timestamp","sentiment","intent","emotion"])
     return pd.DataFrame(st.session_state["messages"])
-
 
 def convert_df_to_csv_bytes(df: pd.DataFrame):
     buf = BytesIO()
@@ -156,13 +179,11 @@ def convert_df_to_csv_bytes(df: pd.DataFrame):
     return buf.getvalue()
 
 # ---------------------------
-# 5) UI - Header & layout
+# UI - Header & layout
 # ---------------------------
-st.set_page_config(page_title="SCXIS", page_icon="🤖", layout="wide")
 st.title(st.session_state["title"])
 
-left_col, right_col = st.columns([2, 1])
-
+left_col, right_col = st.columns([2,1])
 with right_col:
     st.markdown("**Quick Actions**")
     if st.button("Export chat CSV"):
@@ -171,43 +192,51 @@ with right_col:
             st.warning("No messages to export.")
         else:
             csv_bytes = convert_df_to_csv_bytes(df)
-            st.download_button(
-                label="Download chat history CSV",
-                data=csv_bytes,
-                file_name="scxis_chat_history.csv",
-                mime="text/csv",
-            )
+            st.download_button("Download chat history CSV", data=csv_bytes, file_name="scxis_chat_history.csv", mime="text/csv")
     st.markdown("---")
-    csat_stats = compute_csat_stats()
-    st.metric("CSAT Avg", f"{csat_stats['avg']:.2f}" if csat_stats["avg"] is not None else "N/A", delta=None)
-    st.caption(f"CSAT Samples: {csat_stats['count']}")
+    csat_count = len(st.session_state["csat"])
+    csat_avg = (sum(st.session_state["csat"]) / csat_count) if csat_count else None
+    st.metric("CSAT Avg", f"{csat_avg:.2f}" if csat_avg is not None else "N/A")
+    st.caption(f"CSAT Samples: {csat_count}")
+    st.markdown("---")
+    if not HF_TOKEN:
+        st.warning("HF_API_TOKEN missing in Streamlit secrets — using local heuristics as fallback. Set HF_API_TOKEN to enable HF inference API.")
 
 # ---------------------------
-# 6) Navigation
+# Navigation
 # ---------------------------
 page = st.sidebar.radio("Navigation", ["Live Chat", "Dashboard", "Chat History", "Settings"])
 
 # ---------------------------
-# 7) Live Chat page
+# Live Chat
 # ---------------------------
 if page == "Live Chat":
     st.header("💬 Live Chat")
-    st.markdown("Interact with the system. The AI analyzes sentiment, intent, and emotion in real-time.")
+    st.markdown("Type a message — the system analyzes sentiment, intent, and emotion.")
 
-    # Chat input area
     with st.form("chat_form", clear_on_submit=True):
         user_text = st.text_input("Type your message", key="user_input")
         submitted = st.form_submit_button("Send")
         if submitted and user_text:
-            # analyze
-            sent_label, sent_score = analyze_sentiment(user_text)
-            intent_label, intent_score = detect_intent(user_text)
-            emotion_label, emotion_score = detect_emotion(user_text)
+            # Prefer HF API; fall back to heuristics if HF token missing or call fails
+            try:
+                sent_label, sent_score = analyze_sentiment_hf(user_text)
+            except Exception:
+                sent_label, sent_score = heuristic_sentiment(user_text)
 
-            # append user
+            try:
+                intent_label, intent_score = detect_intent_hf(user_text, CANDIDATE_INTENTS)
+            except Exception:
+                intent_label, intent_score = heuristic_intent(user_text), 0.0
+
+            try:
+                emotion_label, emotion_score = detect_emotion_hf(user_text)
+            except Exception:
+                emotion_label, emotion_score = heuristic_emotion(user_text)
+
             append_message("user", user_text, sentiment=sent_label, intent=intent_label, emotion=emotion_label)
 
-            # generate a simple response (rule-based + placeholders)
+            # simple response logic
             if intent_label == "complaint" and sent_label == "negative":
                 bot_text = "😟 I'm sorry you're facing this issue. I'll escalate this to our support team."
             elif intent_label == "query":
@@ -217,7 +246,6 @@ if page == "Live Chat":
             elif intent_label == "greeting":
                 bot_text = "👋 Hello! How can I assist you today?"
             else:
-                # tone aware default
                 if sent_label == "positive":
                     bot_text = "🙂 Great to hear! Anything else I can help with?"
                 elif sent_label == "negative":
@@ -225,21 +253,22 @@ if page == "Live Chat":
                 else:
                     bot_text = "Thanks for sharing — I'll note this."
 
-            append_message("bot", bot_text, sentiment=None, intent=None, emotion=None)
+            append_message("bot", bot_text)
+            # rerun to show new messages
             st.experimental_rerun()
 
-    # show recent messages
-    st.subheader("Conversation")
-    msgs = st.session_state["messages"][-20:]
+    # show conversation
+    st.subheader("Conversation (most recent)")
+    msgs = st.session_state["messages"][-30:]
     for m in msgs:
         ts = m["timestamp"]
         if m["role"] == "user":
-            st.markdown(f"**You** ({ts}):  {m['text']}")
+            st.markdown(f"**You** ({ts}): {m['text']}")
             st.caption(f"Sentiment: {m['sentiment'] or '-'} | Intent: {m['intent'] or '-'} | Emotion: {m['emotion'] or '-'}")
         else:
-            st.markdown(f"**Bot** ({ts}):  {m['text']}")
+            st.markdown(f"**Bot** ({ts}): {m['text']}")
 
-    # collect CSAT optionally
+    # CSAT
     with st.expander("Provide CSAT (optional)"):
         csat = st.slider("Rate your experience (1 = Poor, 5 = Excellent)", 1, 5, 4, key="csat_slider")
         if st.button("Submit CSAT"):
@@ -247,7 +276,7 @@ if page == "Live Chat":
             st.success("Thanks — your rating has been recorded.")
 
 # ---------------------------
-# 8) Dashboard page
+# Dashboard
 # ---------------------------
 elif page == "Dashboard":
     st.header("📊 Insights Dashboard")
@@ -260,23 +289,20 @@ elif page == "Dashboard":
     with col1:
         st.subheader("Sentiment Distribution")
         if not user_df.empty:
-            sent_counts = user_df["sentiment"].value_counts()
-            st.bar_chart(sent_counts)
+            st.bar_chart(user_df["sentiment"].value_counts())
         else:
             st.info("No user messages yet.")
 
     with col2:
         st.subheader("Intent Distribution")
         if not user_df.empty:
-            intent_counts = user_df["intent"].value_counts()
-            st.bar_chart(intent_counts)
+            st.bar_chart(user_df["intent"].value_counts())
         else:
             st.info("No user messages yet.")
 
     st.subheader("Emotion Distribution")
     if not user_df.empty:
-        emo_counts = user_df["emotion"].value_counts()
-        st.bar_chart(emo_counts)
+        st.bar_chart(user_df["emotion"].value_counts())
     else:
         st.info("No user messages yet.")
 
@@ -290,7 +316,6 @@ elif page == "Dashboard":
     st.markdown("---")
     st.subheader("Recent Key Insights")
     if not user_df.empty:
-        # Simple trend: top intents and any spike of negatives
         top_intent = user_df["intent"].mode().iloc[0] if not user_df["intent"].empty else "N/A"
         neg_pct = (user_df["sentiment"] == "negative").sum() / max(1, len(user_df)) * 100
         st.write(f"- Top intent this session: **{top_intent}**")
@@ -299,7 +324,7 @@ elif page == "Dashboard":
         st.write("No insights yet — invite users to chat.")
 
 # ---------------------------
-# 9) Chat History page
+# Chat History
 # ---------------------------
 elif page == "Chat History":
     st.header("📜 Chat History")
@@ -307,13 +332,12 @@ elif page == "Chat History":
     if df_all.empty:
         st.info("No chat history yet.")
     else:
-        # show table and allow filters
         st.dataframe(df_all.sort_values(by="timestamp", ascending=False).reset_index(drop=True))
         csv_bytes = convert_df_to_csv_bytes(df_all)
         st.download_button("Download full chat CSV", csv_bytes, "scxis_full_chat_history.csv", "text/csv")
 
 # ---------------------------
-# 10) Settings page
+# Settings
 # ---------------------------
 elif page == "Settings":
     st.header("⚙️ Settings & About")
@@ -321,7 +345,11 @@ elif page == "Settings":
         """
         **SCXIS** — Smart Customer Experience Intelligence System  
         Components: Chat interface, Sentiment, Intent, Emotion, CSAT, Dashboard.  
-        Models: DistilBERT (sentiment), DistilBART (intent), DistilRoBERTa (emotion).
+        This deployment uses the Hugging Face Inference API to avoid heavy local dependencies.
         """
     )
+    st.markdown("Notes:")
+    st.markdown("- Set `HF_API_TOKEN` in Streamlit Secrets to enable HF inference. Without it the app uses light heuristics.")
+    st.markdown("- HF Inference API may add latency on first calls; consider caching repeated calls if needed.")
+
     st.markdown("Model loading is cached to improve performance. For production, consider persistent DB storage and authentication.")
